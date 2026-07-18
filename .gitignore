@@ -1,2 +1,6 @@
-/books
+data
+logs
+models
+output
 __pycache__
+.python-version
