@@ -7,9 +7,11 @@
 
 # ---- dependencies {{{
 import argparse
+import asyncio
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from random import randint
 
@@ -80,33 +82,45 @@ def consolidate_delimiter(text, delim, opts):
     return text
 
 
-def process(agent, prompt: str, info: dict) -> pd.DataFrame:
-    msgs = msgs_from_text(prompt=prompt, text=info["text"], sep=info["delimiter"])
-    nmessages = len(msgs)
-    responses = []
-    for i in range(nmessages):
-        logger.info(f"processing message {i + 1} out of {nmessages}")
-        msg = msgs[i]
-        resp = langrequest(agent=agent, messages={"messages": msg})
-        if resp is not None:
-            resp_data = pd.DataFrame([resp["structured_response"].model_dump()])
+async def multiplerequests(agent, messages):
+    tasks = [langrequest(agent=agent, messages={"messages": msg}) for msg in messages]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    return gathered
+
+
+def prepare(prompt: str, data: pd.DataFrame) -> (pd.DataFrame, list):
+    copy = data.copy()
+    copy["messages"] = copy.text.apply(
+        lambda x: msgs_from_text(prompt=prompt, text=x, sep=args.delimiter)
+    )
+    copy["sections"] = copy.messages.apply(
+        lambda msgs: [msg["content"].split(":** ")[1] for msg in msgs]
+    )
+    copy["sectionids"] = copy.sections.apply(
+        lambda sections: [hashstr(x) for x in sections]
+    )
+    copy = copy.explode(["messages", "sections", "sectionids"])
+    messages = copy.messages.values
+    copy.drop(columns="messages", inplace=True)
+    return copy, messages
+
+
+async def formatresponses(responses: list):
+    dfs = []
+    for resp in responses:
+        if asyncio.iscoroutine(resp):
+            structured_response = await resp["structured_response"]
         else:
-            resp_data = pd.DataFrame([{"error_no_response": True}])
-        resp_data["textid"] = info["textid"]
-        resp_data["filename"] = info["textpath"]
-        resp_data["prompt"] = prompt
-        resp_data["section"] = msg["content"].split(":** ")[1]
-        resp_data["sectionid"] = resp_data.section.apply(hashstr)
-        resp_data["recordid"] = (
-            resp_data.textid.str[:6] + "_" + resp_data.sectionid.str[:6]
-        )
-        responses.append(resp_data)
-    out = pd.concat(responses)
-    out.reset_index(drop=True, inplace=True)
+            structured_response = resp["structured_response"]
+        resp_data = pd.DataFrame([structured_response.model_dump()])
+        dfs.append(resp_data)
+    out = pd.concat(dfs)
+    if args.datatype == "Event":
+        out.timestamp = out.timestamp.apply(datetime.date).astype(str)
     return out
 
 
-def makereport_md(info):
+def makereport_md(info: dict, texts, responses: pd.DataFrame) -> MdUtils:
     """Should we be using new_table instead of new_paragraph w/ html passed?
     Guess is no because we don't want this script to bother too much
     with what appears in the html - since those columns are based on the requested
@@ -136,18 +150,18 @@ def makereport_md(info):
     report.new_header(level=2, title="Extractions via LLM")
     report.new_header(level=3, title="General info")
     report.new_paragraph(f"""
-    - Text divided into {info["responses"].shape[0]:,} sections using delimiter "{info["delimiter"]}"
+    - Text divided into {texts.sectionids.explode().nunique()} sections using delimiter "{info["delimiter"]}"
     - 1 section per message to LLM
     """)
     report.new_header(level=3, title=f"Sample extracted {args.datatype} record")
-    report.new_paragraph(info["responses"].sample().T.to_html())
+    report.new_paragraph(responses.sample().T.to_html())
     report.new_paragraph()
     report.new_header(level=3, title=f"First 5 {args.datatype}s extracted")
-    report.new_paragraph(info["responses"].head().to_html())
+    report.new_paragraph(responses.head().to_html())
 
     report.new_paragraph("---")
-    report.new_header(level=1, title="Text analyzed (first 5,000 characters)")
-    report.new_paragraph(info["text"][:5000])
+    report.new_header(level=1, title="Text analyzed (first 3,000 characters)")
+    report.new_paragraph(info["text"][:3000])
     report.new_paragraph("---")
 
     report.new_table_of_contents(table_title="Contents", depth=2)
@@ -161,7 +175,7 @@ args = getargs()
 setuplogging("logs/main.log")
 
 infile = resolveinput(filepath=args.input)
-text = readtext(filepath=infile)[:5000]
+text = readtext(filepath=infile)
 text = consolidate_delimiter(
     text, delim=args.delimiter, opts=["PAGE #1", "Page# 1", "Page #1"]
 )
@@ -181,27 +195,28 @@ prompt = writeprompt(datatype=args.datatype, sep=":** ")
 logger.info(f"applying prompt\n{prompt}")
 info["prompt"] = prompt
 agent = setupagent(prompt=prompt, datatype=args.datatype)
-responses = process(agent=agent, prompt=prompt, info=info)
-sections = responses[["textid", "sectionid", "section"]]
-responses.drop(columns="section", inplace=True)
-info["responses"] = responses
+
+texts = pd.DataFrame([info])
+texts, messages = prepare(prompt=prompt, data=texts)
+responses = asyncio.run(multiplerequests(agent, messages))
+responses = asyncio.run(formatresponses(responses))
 
 # @TODO: handle existing outputs more intentionally
 outdir = f"{args.outdir}/{info['textid']}"
 if not Path(outdir).exists():
     subprocess.call(["mkdir", outdir])
 else:
-    print(
+    logger.info(
         f"\n\nWARNING: Textid {
             info['textid']
         } found in output directory already\n\nContents:\n"
     )
-    print(os.listdir(outdir))
+    logger.info(os.listdir(outdir))
 
-report = makereport_md(info)
+report = makereport_md(info, texts, responses)
 report.create_md_file()
 
-sections.to_parquet(f"{outdir}/{args.datatype}_sections.parquet")
+texts.to_parquet(f"{outdir}/{args.datatype}_sections.parquet")
 responses.to_parquet(f"{outdir}/{args.datatype}_responses.parquet")
 
 logger.info("done")
