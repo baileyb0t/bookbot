@@ -1,6 +1,6 @@
 # bookbot
 
-BookBot started as a [Boot.dev](https://www.boot.dev) project, and I am expanding the project to incorporate more text data processing techniques, including with the [LLooM](https://stanfordhci.github.io/lloom/about/) research tool for data analysis on unstructured text data.
+BookBot started as a [Boot.dev](https://www.boot.dev) project, and I am expanding the project to incorporate more text data processing techniques.
 
 # tips from install
 
@@ -8,5 +8,4 @@ BookBot started as a [Boot.dev](https://www.boot.dev) project, and I am expandin
 
 # current version requirements
 
-- python>=3.9,<3.13
-- numpy<=2.0
+- check the pyproject.toml file.
