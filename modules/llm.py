@@ -7,10 +7,11 @@
 
 # ---- dependencies {{{
 import argparse
+import asyncio
 import hashlib
 import os
 import sys
-from os.path import isdir, isfile
+from os.path import isfile
 from pathlib import Path
 
 import langchain_mistralai
@@ -94,19 +95,10 @@ def hashstr(text):
     return asid
 
 
-def langrequest(agent, messages):
-    """@TODO: Swap for longterm fix
-    Wrapped the invoke call in some try-except clauses
-    because I'm getting rate limited even though I'm on the paid Scale plan,
-    and this is a hacky workaround to stall before trying message again
-    But yeah, do that asynchronously or something"""
-    try:
-        try:
-            result = agent.invoke(messages)
-        except:
-            result = agent.invoke(messages)
-    except:
-        result = None
+async def langrequest(agent, messages):
+    result = agent.invoke(messages)
+    if asyncio.iscoroutine(result):
+        result = await result
     return result
 
 
@@ -152,30 +144,41 @@ def setupagent(prompt: str, datatype: str, model=MODEL):
     return agent
 
 
-def process(agent, prompt: str, data: pd.DataFrame) -> pd.DataFrame:
-    shuffled = data.copy().sample(data.shape[0])
-    responses = []
-    for record in shuffled.head(5).itertuples():
-        rowid = record.Index
-        fname = record.filename
-        text = record.text
-        msgs = msgs_from_text(prompt=prompt, text=text, sep=TEXT_DELIMITER)
-        nmessages = len(msgs)
-        logger.info(
-            f"processing record ID {rowid} with filename {fname} and {nmessages} messages"
-        )
-        for i in range(len(msgs)):
-            logger.info(f"processing message {i + 1} out of {nmessages}")
-            msg = msgs[i]
-            resp = langrequest(agent=agent, messages={"messages": msg})
-            resp_data = pd.DataFrame([resp["structured_response"].model_dump()])
-            resp_data["recordid"] = rowid
-            resp_data["filename"] = fname
-            resp_data["prompt"] = prompt
-            resp_data["section"] = msg["content"].split(PROMPT_SEPARATOR)[1]
-            resp_data["section_id"] = resp_data.section.apply(hashstr)
-            responses.append(resp_data)
-    out = pd.concat(responses)
+async def multiplerequests(agent, messages):
+    tasks = [langrequest(agent=agent, messages={"messages": msg}) for msg in messages]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    return gathered
+
+
+def prepare(prompt: str, data: pd.DataFrame) -> (pd.DataFrame, list):
+    copy = data.copy()
+    copy["messages"] = copy.text.apply(
+        lambda x: msgs_from_text(prompt=prompt, text=x, sep=TEXT_DELIMITER)
+    )
+    copy["sections"] = copy.messages.apply(
+        lambda msgs: [msg["content"].split(PROMPT_SEPARATOR)[1] for msg in msgs]
+    )
+    copy["sectionids"] = copy.sections.apply(
+        lambda sections: [hashstr(x) for x in sections]
+    )
+    copy = copy.explode(["messages", "sections", "sectionids"])
+    messages = copy.messages.values
+    copy.drop(columns="messages", inplace=True)
+    return copy, messages
+
+
+async def formatresponses(responses: list) -> pd.DateFrame:
+    dfs = []
+    for resp in responses:
+        if asyncio.iscoroutine(resp):
+            structured_response = await resp["structured_response"]
+        else:
+            structured_response = resp["structured_response"]
+        resp_data = pd.DataFrame([structured_response.model_dump()])
+        dfs.append(resp_data)
+    out = pd.concat(dfs)
+    if args.datatype == "Event":
+        out.timestamp = out.timestamp.apply(datetime.date).astype(str)
     return out
 
 
@@ -196,7 +199,9 @@ if __name__ == "__main__":
     texts = pd.DataFrame(texts)
 
     logger.info("begin processing message(s)")
-    responses = process(agent=agent, prompt=prompt, data=texts)
+    texts, messages = prepare(prompt=prompt, data=texts)
+    responses = asyncio.run(multiplerequests(agent, messages))
+    responses = asyncio.run(formatresponses(responses))
 
     logger.info("writing formatted response data")
     responses.to_parquet(args.output)
